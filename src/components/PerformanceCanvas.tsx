@@ -1,6 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { getWebcam } from '../lib/webcam';
 import { initMediapipe, processFrame, disposeMediapipe } from '../lib/mediapipe';
+import { renderAscii, type AudioFeatures } from '../lib/asciiRenderer';
+import { drawContour, PoseOverlay } from '../lib/poseOverlay';
+import { getAudioFeatures } from '../lib/audio';
+import { usePerformanceStore } from '../stores/performanceStore';
+import { getScene } from '../lib/scenes';
+
+const SILENT: AudioFeatures = {
+  amplitude: 0,
+  bass: 0,
+  mid: 0,
+  treble: 0,
+  beat: false,
+};
 
 export default function PerformanceCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -11,7 +24,6 @@ export default function PerformanceCanvas() {
     let cancelled = false;
     let raf = 0;
     const handle = getWebcam();
-
     if (!handle) {
       setError('Webcam handle missing. Return to setup.');
       return;
@@ -20,7 +32,6 @@ export default function PerformanceCanvas() {
     const canvas = canvasRef.current!;
     const ctx = canvas.getContext('2d', { alpha: false })!;
 
-    // Sized to viewport, but pixel-perfect via DPR.
     function resize() {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       canvas.width = Math.floor(window.innerWidth * dpr);
@@ -31,71 +42,95 @@ export default function PerformanceCanvas() {
     resize();
     window.addEventListener('resize', resize);
 
-    // Offscreen buffer for the mask at the source resolution.
-    const maskCanvas = document.createElement('canvas');
-    const maskCtx = maskCanvas.getContext('2d')!;
-    let maskImageData: ImageData | null = null;
+    const overlay = new PoseOverlay();
 
     let frames = 0;
     let lastFpsTick = performance.now();
+    let lastSceneTick = performance.now();
+    let lastSceneIdx = usePerformanceStore.getState().currentSceneIndex;
+    let frameCounter = 0;
+    // Throttle pose if fps drops below 25.
+    let recentFps = 30;
+    let posePer = 1; // 1 = every frame, 2 = every other.
 
     initMediapipe()
       .then(() => {
         if (cancelled) return;
         const tick = (tsMs: number) => {
           if (cancelled) return;
+          const state = usePerformanceStore.getState();
           const video = handle.video;
+
           if (video.readyState >= 2 && video.videoWidth > 0) {
             try {
-              const { maskData, maskWidth, maskHeight } = processFrame(
-                video,
-                tsMs,
-                { runPose: false },
-              );
+              const runPose = frameCounter % posePer === 0;
+              const { maskData, maskWidth, maskHeight, landmarks } =
+                processFrame(video, tsMs, { runPose });
+
+              const audio: AudioFeatures = (() => {
+                try {
+                  return getAudioFeatures(tsMs);
+                } catch {
+                  return SILENT;
+                }
+              })();
 
               if (maskData && maskWidth > 0 && maskHeight > 0) {
-                if (
-                  !maskImageData ||
-                  maskCanvas.width !== maskWidth ||
-                  maskCanvas.height !== maskHeight
-                ) {
-                  maskCanvas.width = maskWidth;
-                  maskCanvas.height = maskHeight;
-                  maskImageData = maskCtx.createImageData(maskWidth, maskHeight);
+                const scene = getScene(state.currentSceneIndex);
+                const cellSize = state.cellSizeOverride ?? scene.cellSize;
+                const ramp = state.rampOverride ?? scene.charRamp;
+                const colorMode = state.colorModeOverride ?? scene.colorMode;
+                const bg =
+                  state.images.length > 0
+                    ? state.images[
+                        state.currentImageIndex % state.images.length
+                      ].bitmap
+                    : null;
+
+                renderAscii({
+                  ctx,
+                  canvasWidth: canvas.width,
+                  canvasHeight: canvas.height,
+                  scene,
+                  cellSize,
+                  charRamp: ramp,
+                  colorMode,
+                  maskData,
+                  maskWidth,
+                  maskHeight,
+                  mirrorX: true,
+                  bgImage: bg,
+                  audio,
+                  timestampMs: tsMs,
+                });
+
+                if (scene.effects.contour) {
+                  drawContour(
+                    ctx,
+                    maskData,
+                    maskWidth,
+                    maskHeight,
+                    canvas.width,
+                    canvas.height,
+                    true,
+                    scene.monoColor ?? '#e5e7eb',
+                    audio,
+                  );
                 }
 
-                const px = maskImageData.data;
-                // Selfie segmenter: confidence = probability the pixel belongs
-                // to the foreground (person).
-                for (let i = 0; i < maskData.length; i++) {
-                  const v = Math.round(maskData[i] * 255);
-                  const j = i * 4;
-                  px[j] = v;
-                  px[j + 1] = v;
-                  px[j + 2] = v;
-                  px[j + 3] = 255;
-                }
-                maskCtx.putImageData(maskImageData, 0, 0);
-
-                ctx.fillStyle = '#000';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-                // Cover-fit the mask to the canvas, mirrored (selfie view).
-                const cw = canvas.width;
-                const ch = canvas.height;
-                const scale = Math.max(cw / maskWidth, ch / maskHeight);
-                const dw = maskWidth * scale;
-                const dh = maskHeight * scale;
-                const dx = (cw - dw) / 2;
-                const dy = (ch - dh) / 2;
-
-                ctx.save();
-                ctx.translate(cw, 0);
-                ctx.scale(-1, 1);
-                ctx.imageSmoothingEnabled = false;
-                ctx.drawImage(maskCanvas, cw - dx - dw, dy, dw, dh);
-                ctx.restore();
+                overlay.draw(
+                  ctx,
+                  canvas.width,
+                  canvas.height,
+                  landmarks,
+                  scene,
+                  audio,
+                  tsMs,
+                  true,
+                );
               }
+
+              frameCounter++;
             } catch (err) {
               if (!cancelled) {
                 setError(err instanceof Error ? err.message : String(err));
@@ -107,9 +142,34 @@ export default function PerformanceCanvas() {
           frames++;
           const now = performance.now();
           if (now - lastFpsTick >= 1000) {
-            setFps(Math.round((frames * 1000) / (now - lastFpsTick)));
+            recentFps = Math.round((frames * 1000) / (now - lastFpsTick));
+            setFps(recentFps);
             frames = 0;
             lastFpsTick = now;
+            // Throttle pose detection if we're dragging.
+            posePer = recentFps < 25 ? 2 : 1;
+          }
+
+          // Auto-progression
+          if (state.autoProgress) {
+            if (now - lastSceneTick >= state.autoProgressInterval) {
+              const cur = usePerformanceStore.getState().currentSceneIndex;
+              const sceneCount = 6;
+              const next = (cur + 1) % sceneCount;
+              usePerformanceStore.getState().setScene(next);
+              // Advance background image every other scene change (default).
+              if (next % 2 === 0) usePerformanceStore.getState().cycleImage();
+              lastSceneTick = now;
+            }
+          } else {
+            lastSceneTick = now;
+          }
+
+          // If the scene was changed manually, reset hand trails so they don't
+          // look like ghosts of the previous scene's color/style.
+          if (state.currentSceneIndex !== lastSceneIdx) {
+            overlay.resetTrails();
+            lastSceneIdx = state.currentSceneIndex;
           }
 
           raf = requestAnimationFrame(tick);
